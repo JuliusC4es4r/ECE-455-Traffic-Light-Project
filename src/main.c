@@ -46,16 +46,12 @@ static void adcInit(void);
 static void gpioInit(void);
 static uint16_t getADC(void);
 
-SemaphoreHandle_t trafficOutputMutex;
-uint32_t trafficOutput = 0x00000000;
-
-SemaphoreHandle_t potValueMutex;
-uint32_t potValue = 0;
-
 SemaphoreHandle_t trafficLightMutex;
 uint8_t trafficLight = RED_STATE;
 
-TimerHandle_t displayTimer;
+QueueHandle_t trafficOutputQueue, potValueQueue, trafficLightQueue;
+
+TimerHandle_t trafficLightTimer;
 
 
 /*-----------------------------------------------------------*/
@@ -72,29 +68,28 @@ int main(void)
 	adcInit();
 	gpioInit();
 
-	displayTimer = xTimerCreate(
-			"displayTimer",
-			pdMS_TO_TICKS(1000 / portTICK_RATE_MS),
+	trafficOutputQueue = xQueueCreate(1,sizeof(uint32_t));
+	potValueQueue = xQueueCreate(1,sizeof(uint32_t));
+
+	uint32_t initialTraffic = 0xAAAAAAAA;
+	xQueueSend(trafficOutputQueue, &initialTraffic, (TickType_t) 10 );
+
+	trafficLightTimer = xTimerCreate(
+			"trafficLightTimer",
+			pdMS_TO_TICKS(1000),
 			pdTRUE,
 			(void*)0,
-			SystemDisplay
+			LightState
 	);
 
-	xTimerStart(displayTimer, portMAX_DELAY);
-
-	trafficOutputMutex = xSemaphoreCreateMutex();
-	xSemaphoreGive(trafficOutputMutex);
-
-	potValueMutex = xSemaphoreCreateMutex();
-	xSemaphoreGive(potValueMutex);
+	xTimerStart(trafficLightTimer, portMAX_DELAY);
 
 	trafficLightMutex = xSemaphoreCreateMutex();
 	xSemaphoreGive(trafficLightMutex);
 
 	xTaskCreate( TrafficFlowAdjustment, "Traffic Flow", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
 	xTaskCreate( TrafficGenerator, "Traffic Generator", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
-	xTaskCreate( LightState, "Traffic Light", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
-//	xTaskCreate( SystemDisplay, "System Display", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+	xTaskCreate( SystemDisplay, "System Display", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
 
 	/* Start the tasks and timer running. */
 	vTaskStartScheduler();
@@ -174,13 +169,10 @@ static void TrafficFlowAdjustment( void *pvParameters )
 	while(1)
 	{
 		rawADC = getADC();
-//		printf("%d\n", rawADC);
 
-		xSemaphoreTake(potValueMutex, portMAX_DELAY);
-		potValue = rawADC;
-		xSemaphoreGive(potValueMutex);
+		xQueueSend(potValueQueue, &rawADC, (TickType_t) 10);
 
-		vTaskDelay(500 / portTICK_RATE_MS);
+		vTaskDelay(100 / portTICK_RATE_MS);
 	}
 }
 
@@ -190,15 +182,8 @@ static void TrafficGenerator( void *pvParameters )
 {
 	while(1)
 	{
-		uint8_t tempState;
-		xSemaphoreTake(trafficLightMutex, portMAX_DELAY);
-		tempState = trafficLight;
-		xSemaphoreGive(trafficLightMutex);
-
 		uint16_t tempADC;
-		xSemaphoreTake(potValueMutex, portMAX_DELAY);
-		tempADC = potValue;
-		xSemaphoreGive(potValueMutex);
+		xQueueReceive(potValueQueue, &tempADC, (TickType_t) 10);
 
 		int flowRate = (int) ( 6500 - (5.5 * tempADC) );
 		float tempRand = (rand() % 6 ) * 50;
@@ -209,28 +194,30 @@ static void TrafficGenerator( void *pvParameters )
 
 		vTaskDelay(generationDelay / portTICK_RATE_MS);
 
-		xSemaphoreTake(trafficOutputMutex, portMAX_DELAY);
-		trafficOutput |= 0x0001;
-		xSemaphoreGive(trafficOutputMutex);
+		uint32_t tempTrafficOutput;
+		xQueueReceive(trafficOutputQueue, &tempTrafficOutput, (TickType_t) 10);
+		tempTrafficOutput |= 0x0001;
+		xQueueSend(trafficOutputQueue, &tempTrafficOutput, (TickType_t) 10);
 	}
 }
 
 
 /*-----------------------------------------------------------*/
 
-static void LightState( void *pvParameters )
+static void LightState( TimerHandle_t xTimer )
 {
 	while(1)
 	{
 		uint8_t tempState;
+
 		xSemaphoreTake(trafficLightMutex, portMAX_DELAY);
 		tempState = trafficLight;
 		xSemaphoreGive(trafficLightMutex);
 
+
+
 		uint16_t tempADC;
-		xSemaphoreTake(potValueMutex, portMAX_DELAY);
-		tempADC = potValue;
-		xSemaphoreGive(potValueMutex);
+		xQueueReceive(potValueQueue, &tempADC, (TickType_t) 10);
 
 		int flowRate = (int) ( 7500 - (5 * tempADC) );
 		int inverseFlowRate = (int) ( 2500 + (5 * tempADC) );
@@ -284,7 +271,7 @@ static void LightState( void *pvParameters )
 
 /*-----------------------------------------------------------*/
 
-static void SystemDisplay( TimerHandle_t xTimer )
+static void SystemDisplay( void *pvParameters )
 {
 	while(1)
 	{
@@ -292,16 +279,14 @@ static void SystemDisplay( TimerHandle_t xTimer )
 		vTaskDelay(1 / portTICK_RATE_MS);
 		GPIO_SetBits(GPIOC, RESET_PIN);
 
-		uint32_t tempTraffic;
-		xSemaphoreTake(trafficOutputMutex, portMAX_DELAY);
-		tempTraffic = trafficOutput;
-		xSemaphoreGive(trafficOutputMutex);
+		uint32_t trafficOutput;
+		xQueueReceive(trafficOutputQueue, &trafficOutput, (TickType_t) 10);
 
 		for(int i = 0; i < 20; i++)
 		{
 			GPIO_SetBits(GPIOC, CLOCK_PIN);
 
-			if(tempTraffic & (0x00000001 << i))
+			if(trafficOutput & (0x00000001 << i))
 			{
 				GPIO_SetBits(GPIOC, DATA_PIN);
 			}
@@ -321,31 +306,40 @@ static void SystemDisplay( TimerHandle_t xTimer )
 
 		if(tempState == GREEN_STATE)
 		{
-			xSemaphoreTake(trafficOutputMutex, portMAX_DELAY);
+
 			trafficOutput = trafficOutput << 1;
-			xSemaphoreGive(trafficOutputMutex);
+			xQueueSend(trafficOutputQueue, &trafficOutput, (TickType_t) 10);
+
 		}
 		else
 		{
-			xSemaphoreTake(trafficOutputMutex, portMAX_DELAY);
 
 			uint32_t postLight = trafficOutput & 0xFFFFFF00;
-			uint8_t preLight = trafficOutput & 0xFF;
+			uint8_t lights = trafficOutput & 0xFF;
 
-			for(int i = 7; i >= 0; i--)
+			uint8_t result, mask, bits_to_shift = 0x00;
+			int n = 0;
+			for(int j = 7; j >= 0; j--)
 			{
-				if( !(preLight & (0x01 << i) ))
+				if((lights & (0x01 << j)) == 0)
 				{
-//					preLight = ((preLight & (((0x00FF << (i-1)) & 0xFF00))) << 1) & (0xFF00 >> (8-i));
-					preLight = ((preLight & ((((0x00FF << (i-1)) & 0xFF00) >> 8 )) << 1) & (0xFF00 >> (8-i)) );
+					n = j;
+					break;
 				}
 			}
 
-			trafficOutput = (postLight << 1) | preLight;
+			mask = (0x01 << n) - 1; // create mask for n least significant bits
+			bits_to_shift = lights & mask; // isolate n least significant bits
+			bits_to_shift <<= 1; // shift bits left by n positions
+			result = bits_to_shift | (lights & ~mask); // combine shifted bits with n-1 most significant bits
 
-			xSemaphoreGive(trafficOutputMutex);
+			lights = result;
+
+			trafficOutput = (postLight << 1) | lights;
+
+			xQueueSend(trafficOutputQueue, &trafficOutput, (TickType_t) 10);
+
 		}
-
 		vTaskDelay(1000);
 	}
 }
